@@ -1,0 +1,9 @@
+polars>=1.0.0
+duckdb>=1.0.0
+pandas>=2.0.0
+rapidfuzz>=3.6.0
+datasketch>=1.6.4
+scikit-learn>=1.4.0
+lightgbm>=4.3.0
+numpy>=1.26.0
+tqdm>=4.66.0

@@ -1,0 +1,29 @@
+# Dataset — never commit, download locally per README
+dataset/train/*.tsv
+dataset/test/*.tsv
+
+# Large generated artifacts
+output/*.tsv
+*.pkl
+*.joblib
+*.bin
+*.model
+feature_matrices/
+*.parquet
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.env
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Keep folder structure without committing data
+!dataset/train/.gitkeep
+!dataset/test/.gitkeep
+!output/.gitkeep
