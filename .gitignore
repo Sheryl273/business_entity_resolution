@@ -11,6 +11,12 @@ output/*.tsv
 feature_matrices/
 *.parquet
 
+# Trained model files and experiment reports (generated locally, not version-controlled)
+models/
+reports/
+# LightGBM saves models as .txt — block them explicitly
+matcher*.txt
+
 # Python
 .venv/
 __pycache__/
@@ -27,3 +33,4 @@ __pycache__/
 !dataset/train/.gitkeep
 !dataset/test/.gitkeep
 !output/.gitkeep
+

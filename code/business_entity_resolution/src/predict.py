@@ -197,20 +197,30 @@ def load_candidate_pair_ids(path: str | Path) -> set[str]:
     """
     Load all candidate entity IDs from candidate_pairs.tsv.
     Used for output validation — predicted IDs must be a subset.
+
+    Fully vectorized via Polars split + explode — no Python row-by-row loop.
     """
     path = Path(path)
     if not path.exists():
         log.warning("candidate_pairs.tsv not found at %s — skipping candidate ID validation", path)
         return set()
-    df = pl.read_csv(path, separator="\t", null_values=["", "NULL"])
-    cand_ids: set[str] = set()
-    for row in df.iter_rows(named=True):
-        raw = row.get("candidate_entity_ids", "")
-        if raw:
-            for tok in str(raw).split(","):
-                tok = tok.strip()
-                if tok:
-                    cand_ids.add(tok)
+    df = pl.read_csv(path, separator="\t", null_values=["NULL"])
+    col = "candidate_entity_ids"
+    if col not in df.columns:
+        log.warning("Column '%s' not found in candidate_pairs.tsv — skipping validation", col)
+        return set()
+
+    # Vectorized: split comma-separated IDs, explode, strip, collect unique set
+    cand_ids: set[str] = set(
+        df
+        .filter(pl.col(col).is_not_null() & (pl.col(col) != ""))
+        .with_columns(pl.col(col).str.split(",").alias("_ids"))
+        .explode("_ids", empty_as_null=True)
+        .with_columns(pl.col("_ids").str.strip_chars())
+        .filter(pl.col("_ids") != "")
+        ["_ids"]
+        .to_list()
+    )
     log.info("Loaded %d unique candidate IDs from candidate_pairs.tsv", len(cand_ids))
     return cand_ids
 
@@ -348,31 +358,45 @@ def validate_output(
             f"{len(nan_rows)} rows have literal 'None'/'nan' in matched_entity_ids"
         )
 
-    # Validate predicted candidate IDs against the candidate pair set
+    # Validate predicted candidate IDs against the candidate pair set (vectorized)
     if candidate_pair_ids:
-        for row in matches_df.filter(pl.col(MATCH_COL) != "").iter_rows(named=True):
-            for cand_id in str(row[MATCH_COL]).split(","):
-                cand_id = cand_id.strip()
-                if cand_id and cand_id not in candidate_pair_ids:
-                    errors.append(
-                        f"Predicted candidate ID '{cand_id}' for S1='{row[S1_COL]}' "
-                        f"not found in candidate_pairs.tsv"
-                    )
-                    if len(errors) > 5:
-                        errors.append("… (additional candidate ID errors omitted)")
-                        break
-            if len(errors) > 5:
-                break
-
-    # Duplicate IDs within a single matched_entity_ids list
-    for row in matches_df.filter(pl.col(MATCH_COL) != "").iter_rows(named=True):
-        ids = [t.strip() for t in str(row[MATCH_COL]).split(",") if t.strip()]
-        if len(ids) != len(set(ids)):
-            errors.append(
-                f"Duplicate candidate IDs in matched_entity_ids for "
-                f"source1_entity_id='{row[S1_COL]}': {ids}"
+        non_empty = matches_df.filter(pl.col(MATCH_COL) != "")
+        if len(non_empty) > 0:
+            exploded_preds = (
+                non_empty
+                .with_columns(pl.col(MATCH_COL).str.split(",").alias("_ids"))
+                .explode("_ids", empty_as_null=True)
+                .with_columns(pl.col("_ids").str.strip_chars())
+                .filter(pl.col("_ids") != "")
             )
-            break
+            all_predicted = set(exploded_preds["_ids"].to_list())
+            invalid_ids = all_predicted - candidate_pair_ids
+            if invalid_ids:
+                sample = sorted(invalid_ids)[:5]
+                errors.append(
+                    f"{len(invalid_ids)} predicted candidate IDs not found in candidate_pairs.tsv. "
+                    f"Sample: {sample}"
+                )
+
+    # Duplicate IDs within a single matched_entity_ids list (vectorized check)
+    non_empty = matches_df.filter(pl.col(MATCH_COL) != "")
+    if len(non_empty) > 0:
+        # Count unique IDs per row vs total IDs per row
+        dup_check = (
+            non_empty
+            .with_columns(pl.col(MATCH_COL).str.split(",").alias("_ids"))
+            .with_columns([
+                pl.col("_ids").list.len().alias("_n_total"),
+                pl.col("_ids").list.unique().list.len().alias("_n_unique"),
+            ])
+            .filter(pl.col("_n_total") != pl.col("_n_unique"))
+        )
+        if len(dup_check) > 0:
+            sample_s1 = dup_check[S1_COL][0]
+            errors.append(
+                f"{len(dup_check)} rows have duplicate candidate IDs in matched_entity_ids. "
+                f"First occurrence: source1_entity_id='{sample_s1}'"
+            )
 
     if errors:
         raise ValueError(

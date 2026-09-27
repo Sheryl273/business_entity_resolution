@@ -89,12 +89,14 @@ def load_id_list_tsv(
     into {source1_entity_id: set(other_ids)}.
     Empty string in list_col -> empty set (singleton).
     Handles: nulls, whitespace, duplicate rows (merged via union).
+
+    Fully vectorized via Polars split + explode — no Python row-by-row loop.
     """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"TSV file not found: {path}")
 
-    df = pl.read_csv(path, separator="\t", null_values=["", "NULL", "null", "NA"])
+    df = pl.read_csv(path, separator="\t", null_values=["NULL", "null", "NA"])
     if id_col not in df.columns:
         raise ValueError(
             f"Column '{id_col}' not found in {path}. Found: {df.columns}"
@@ -104,25 +106,47 @@ def load_id_list_tsv(
             f"Column '{list_col}' not found in {path}. Found: {df.columns}"
         )
 
+    # Cast ID col to string; strip whitespace; drop empty/null IDs
+    df = (
+        df
+        .with_columns(pl.col(id_col).cast(pl.Utf8).str.strip_chars())
+        .filter(pl.col(id_col).is_not_null() & (pl.col(id_col) != ""))
+    )
+
     result: dict[str, set[str]] = {}
-    for row in df.iter_rows(named=True):
-        s1_id = row[id_col]
-        if s1_id is None:
-            continue
-        s1_id = str(s1_id).strip()
-        if not s1_id:
-            continue
 
-        raw = row[list_col]
-        if raw is None or str(raw).strip() == "":
-            ids: set[str] = set()
-        else:
-            ids = {tok.strip() for tok in str(raw).split(",") if tok.strip()}
+    # Singletons: null or empty list_col → empty set
+    singleton_mask = pl.col(list_col).is_null() | (
+        pl.col(list_col).cast(pl.Utf8).str.strip_chars() == ""
+    )
+    for s1_id in df.filter(singleton_mask)[id_col].to_list():
+        if s1_id not in result:
+            result[s1_id] = set()
 
-        if s1_id in result:
-            result[s1_id] |= ids
-        else:
-            result[s1_id] = ids
+    # Non-singletons: vectorized split + explode
+    non_singletons = df.filter(~singleton_mask)
+    if len(non_singletons) > 0:
+        exploded = (
+            non_singletons
+            .with_columns(
+                pl.col(list_col).cast(pl.Utf8).str.strip_chars()
+                .str.split(",")
+                .alias("_ids_list")
+            )
+            .explode("_ids_list", empty_as_null=True)
+            .with_columns(pl.col("_ids_list").str.strip_chars().alias("_cand_id"))
+            .filter(pl.col("_cand_id") != "")
+            .select([id_col, "_cand_id"])
+            .group_by(id_col)
+            .agg(pl.col("_cand_id").unique())
+        )
+        for row in exploded.iter_rows(named=True):
+            s1_id = row[id_col]
+            ids: set[str] = set(row["_cand_id"])
+            if s1_id in result:
+                result[s1_id] |= ids
+            else:
+                result[s1_id] = ids
 
     return result
 
