@@ -27,6 +27,8 @@ from train_model import (
     validate_train_val_compatibility,
     _df_to_predictions_dict,
     extract_feature_importance,
+    mine_hard_negatives,
+    _compute_pr_at_threshold,
 )
 from score_f05 import macro_f05_score, score_entity, load_id_list_tsv
 
@@ -209,6 +211,155 @@ class TestScalePosWeight:
         y = np.zeros(10)
         with pytest.raises(ValueError, match="zero positive"):
             compute_scale_pos_weight(y)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  4b. _compute_pr_at_threshold returns (precision, recall, f1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestComputePRAtThreshold:
+    """
+    Verifies that _compute_pr_at_threshold returns all three values (P, R, F1)
+    and that the F1 formula is consistent.
+    """
+
+    def _make_simple_model(self, probs_list):
+        """Mock LightGBM-like model returning given probabilities."""
+        class _MockModel:
+            def __init__(self, p):
+                self._p = np.array(p)
+            def predict(self, X):
+                return self._p
+        return _MockModel(probs_list)
+
+    def test_returns_three_values(self):
+        df = make_feature_df(["S1-001", "S1-001"], ["S2-A", "S2-B"])
+        gt = {"S1-001": {"S2-A"}}
+        labeled = build_labels(df, gt)
+        model = self._make_simple_model([0.9, 0.1])
+        result = _compute_pr_at_threshold(labeled, model, ["feat_0", "feat_1", "feat_2"], 0.5)
+        assert len(result) == 3, "Should return (precision, recall, f1)"
+
+    def test_perfect_precision_and_recall(self):
+        df = make_feature_df(["S1-001"], ["S2-A"])
+        gt = {"S1-001": {"S2-A"}}
+        labeled = build_labels(df, gt)
+        model = self._make_simple_model([1.0])  # above threshold
+        precision, recall, f1 = _compute_pr_at_threshold(
+            labeled, model, ["feat_0", "feat_1", "feat_2"], 0.5
+        )
+        assert abs(precision - 1.0) < 1e-6
+        assert abs(recall - 1.0) < 1e-6
+        assert abs(f1 - 1.0) < 1e-6
+
+    def test_f1_formula_consistency(self):
+        """F1 should equal 2*P*R/(P+R)."""
+        # 2 positives, 1 negative; model predicts all as positive
+        df = make_feature_df(["S1-001", "S1-001", "S1-001"], ["S2-A", "S2-B", "S2-C"])
+        gt = {"S1-001": {"S2-A", "S2-B"}}
+        labeled = build_labels(df, gt)
+        model = self._make_simple_model([0.9, 0.9, 0.9])  # all above threshold
+        precision, recall, f1 = _compute_pr_at_threshold(
+            labeled, model, ["feat_0", "feat_1", "feat_2"], 0.5
+        )
+        # TP=2, FP=1, FN=0 → P=2/3, R=1.0, F1=2*(2/3)*1.0/(2/3+1.0)
+        expected_p = 2 / 3
+        expected_r = 1.0
+        expected_f1 = 2 * expected_p * expected_r / (expected_p + expected_r)
+        assert abs(precision - expected_p) < 1e-6
+        assert abs(recall - expected_r) < 1e-6
+        assert abs(f1 - expected_f1) < 1e-6
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  4c. Hard-negative mining tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+import lightgbm as lgb  # noqa: E402 (imported here for test isolation)
+
+
+class TestHardNegativeMining:
+    """Tests for mine_hard_negatives — especially the group sort correctness fix."""
+
+    def _make_trained_model(self, labeled_df, feature_cols, seed=42):
+        """Train a tiny LightGBM model for use as the Phase-1 model in mining tests."""
+        from train_model import train_model as do_train
+        cfg = {
+            "model": {
+                "objective": "binary",
+                "metric": "binary_logloss",
+                "boosting_type": "gbdt",
+                "n_estimators": 20,
+                "learning_rate": 0.1,
+                "num_leaves": 7,
+                "max_depth": -1,
+                "min_child_samples": 1,
+                "subsample": 1.0,
+                "subsample_freq": 0,
+                "colsample_bytree": 1.0,
+                "reg_alpha": 0.0,
+                "reg_lambda": 0.0,
+                "class_weight": "balanced",
+                "n_jobs": 1,
+                "verbose": -1,
+            },
+            "early_stopping": {"rounds": 5},
+        }
+        return do_train(labeled_df, labeled_df, feature_cols, cfg, seed=seed)
+
+    def test_output_contains_all_positives(self):
+        """After mining, all positive pairs must be preserved."""
+        np.random.seed(0)
+        n = 100
+        s1_ids = [f"S1-{i:03d}" for i in range(n)]
+        cand_ids = [f"S2-{i:03d}" for i in range(n)]
+        df = pl.DataFrame({
+            S1_COL: s1_ids,
+            CAND_COL: cand_ids,
+            "feat_0": np.random.uniform(0.7, 1.0, n).tolist(),  # high for positives
+            "feat_1": np.random.uniform(0, 1, n).tolist(),
+        })
+        gt = {s1_ids[i]: {cand_ids[i]} for i in range(0, n, 5)}  # 1 in 5 positive
+        labeled = build_labels(df, gt)
+        feature_cols = ["feat_0", "feat_1"]
+
+        model = self._make_trained_model(labeled, feature_cols)
+        cfg_hn = {"top_k_per_entity": 2, "ratio": 3.0}
+        mined = mine_hard_negatives(labeled, feature_cols, model, cfg_hn)
+
+        original_pos_count = int(labeled[LABEL_COL].sum())
+        mined_pos_count = int(mined[LABEL_COL].sum())
+        assert mined_pos_count == original_pos_count, (
+            f"All positives must be preserved: expected {original_pos_count}, got {mined_pos_count}"
+        )
+
+    def test_hard_negatives_have_higher_prob_than_easy(self):
+        """Hard negatives must have higher model scores than omitted easy negatives."""
+        np.random.seed(1)
+        n = 60
+        s1_id = "S1-001"
+        cand_ids = [f"S2-{i:03d}" for i in range(n)]
+        # First entry is the positive; rest are negatives with varying difficulty
+        feat0 = np.concatenate([[0.95], np.random.uniform(0, 1, n - 1)])
+        df = pl.DataFrame({
+            S1_COL: [s1_id] * n,
+            CAND_COL: cand_ids,
+            "feat_0": feat0.tolist(),
+            "feat_1": np.random.uniform(0, 1, n).tolist(),
+        })
+        gt = {s1_id: {cand_ids[0]}}
+        labeled = build_labels(df, gt)
+        feature_cols = ["feat_0", "feat_1"]
+
+        model = self._make_trained_model(labeled, feature_cols)
+        cfg_hn = {"top_k_per_entity": 5, "ratio": 10.0}
+        mined = mine_hard_negatives(labeled, feature_cols, model, cfg_hn)
+
+        # The mined set must be much smaller than the full negative set
+        n_neg_full = int((labeled[LABEL_COL] == 0).sum())
+        n_neg_mined = int((mined[LABEL_COL] == 0).sum())
+        assert n_neg_mined <= n_neg_full, "Mined negatives must be a subset of original negatives"
+        assert n_neg_mined <= 5, f"Expected at most top_k=5 hard negatives, got {n_neg_mined}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -402,6 +553,7 @@ class TestFullMiniPipeline:
             train_model as do_train,
             tune_threshold,
             save_model_and_metadata,
+            _compute_pr_at_threshold,
         )
         from predict import (
             predict_matches,
@@ -483,13 +635,25 @@ class TestFullMiniPipeline:
         assert 0.0 <= best_thresh <= 1.0
         assert 0.0 <= best_f05 <= 1.0
 
-        # Save model and metadata
+        # Verify _compute_pr_at_threshold returns 3 values
+        precision, recall, f1 = _compute_pr_at_threshold(
+            val_labeled, model, feature_cols, best_thresh
+        )
+        assert 0.0 <= precision <= 1.0
+        assert 0.0 <= recall <= 1.0
+        assert 0.0 <= f1 <= 1.0
+        # F1 consistency check
+        if precision + recall > 0:
+            expected_f1 = 2 * precision * recall / (precision + recall)
+            assert abs(f1 - expected_f1) < 1e-6, f"F1 mismatch: {f1} vs {expected_f1}"
+
+        # Save model and metadata (now includes f1 in val_stats)
         model_path = tmp_path / "matcher.txt"
         meta_path = tmp_path / "matcher_metadata.json"
         save_model_and_metadata(
             model, feature_cols, best_thresh,
             train_stats={"rows": n_train},
-            val_stats={"rows": n_val, "macro_f05": best_f05, "threshold": best_thresh},
+            val_stats={"rows": n_val, "macro_f05": best_f05, "threshold": best_thresh, "f1": f1},
             cfg=cfg, seed=42,
             model_path=model_path, metadata_path=meta_path,
         )

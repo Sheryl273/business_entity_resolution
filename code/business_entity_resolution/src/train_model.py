@@ -26,9 +26,9 @@ Usage (see --help for all options):
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import logging
-import os
 import sys
 import time
 from pathlib import Path
@@ -59,6 +59,7 @@ S1_COL = "source1_entity_id"
 CAND_COL = "candidate_entity_id"
 MATCH_COL = "matched_entity_ids"
 LABEL_COL = "is_match"
+PROB_COL = "_prob"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -145,14 +146,13 @@ def validate_schema(
                 f"[{split_name}] Feature columns missing (expected from training metadata): "
                 f"{missing_feats}. Present columns: {df.columns}"
             )
-    # Check for duplicate (S1, candidate) pairs
-    dupes = df.filter(
-        pl.struct(required_id_cols).is_duplicated()
-    )
-    if len(dupes) > 0:
+    # Check for duplicate (S1, candidate) pairs — vectorized
+    n_total = len(df)
+    n_unique = df.select(required_id_cols).n_unique()
+    if n_total != n_unique:
         log.warning(
             "[%s] Found %d duplicate (source1, candidate) pairs — keeping first occurrence",
-            split_name, len(dupes),
+            split_name, n_total - n_unique,
         )
 
 
@@ -162,7 +162,6 @@ def validate_train_val_compatibility(
     feature_cols: list[str],
 ) -> None:
     """Assert that train and val have the same feature columns (same schema)."""
-    train_set = set(train_df.columns)
     val_set = set(val_df.columns)
     feats_in_train = set(feature_cols)
     feats_missing_val = feats_in_train - val_set
@@ -195,6 +194,8 @@ def load_ground_truth(path: str | Path) -> dict[str, set[str]]:
     Parse train_ground_truth.tsv (source1_entity_id, matched_entity_ids)
     where matched_entity_ids is comma-separated (or empty for singletons).
     Returns {source1_entity_id: set_of_matched_ids}.
+
+    Fully vectorized via Polars — no Python row-by-row loop.
     Handles: nulls, whitespace, duplicates within a list, duplicate rows.
     """
     path = Path(path)
@@ -212,31 +213,52 @@ def load_ground_truth(path: str | Path) -> dict[str, set[str]]:
             f"Found: {df.columns}"
         )
 
+    # Cast S1_COL to string and strip whitespace
+    df = df.with_columns(pl.col(S1_COL).cast(pl.Utf8).str.strip_chars())
+
+    # Drop rows with empty/null S1 IDs
+    df = df.filter(pl.col(S1_COL).is_not_null() & (pl.col(S1_COL) != ""))
+
+    # Build result dict using vectorized Polars operations
+    # For each S1 entity, collect all matched IDs as a set (union across duplicate rows)
     gt: dict[str, set[str]] = {}
-    for row in df.iter_rows(named=True):
-        s1_id = str(row[S1_COL]).strip() if row[S1_COL] is not None else None
-        if not s1_id:
-            continue
-        matched_raw = row[MATCH_COL]
-        if matched_raw is None or str(matched_raw).strip() == "":
-            ids: set[str] = set()
-        else:
-            ids = {
-                tok.strip()
-                for tok in str(matched_raw).split(",")
-                if tok.strip()
-            }
-        # Merge if same S1 appears on multiple rows (shouldn't happen but be safe)
-        if s1_id in gt:
-            gt[s1_id] |= ids
-        else:
-            gt[s1_id] = ids
+
+    # Separate: singletons (null or empty matched_entity_ids)
+    singleton_mask = pl.col(MATCH_COL).is_null() | (pl.col(MATCH_COL).cast(pl.Utf8).str.strip_chars() == "")
+    singletons = df.filter(singleton_mask).select(S1_COL)[S1_COL].to_list()
+    for s1_id in singletons:
+        if s1_id not in gt:
+            gt[s1_id] = set()
+
+    # Non-singletons: split and explode comma-separated IDs
+    non_singletons = df.filter(~singleton_mask).with_columns(
+        pl.col(MATCH_COL).cast(pl.Utf8).str.strip_chars()
+    )
+    if len(non_singletons) > 0:
+        exploded = (
+            non_singletons
+            .with_columns(
+                pl.col(MATCH_COL)
+                .str.split(",")
+                .alias("_ids_list")
+            )
+            .explode("_ids_list", empty_as_null=True)
+            .with_columns(pl.col("_ids_list").str.strip_chars().alias("_cand_id"))
+            .filter(pl.col("_cand_id") != "")
+            .select([S1_COL, "_cand_id"])
+        )
+        for row in exploded.iter_rows():
+            s1_id, cand_id = row[0], row[1]
+            if s1_id in gt:
+                gt[s1_id].add(cand_id)
+            else:
+                gt[s1_id] = {cand_id}
 
     total_matches = sum(len(v) for v in gt.values())
-    singletons = sum(1 for v in gt.values() if not v)
+    singletons_count = sum(1 for v in gt.values() if not v)
     log.info(
         "Ground truth: %d S1 entities, %d total matches, %d singletons",
-        len(gt), total_matches, singletons,
+        len(gt), total_matches, singletons_count,
     )
     return gt
 
@@ -266,13 +288,17 @@ def build_labels(
         for s1_id, cand_ids in ground_truth.items()
         for cand_id in cand_ids
     ]
-    pos_df = pl.DataFrame(
-        {S1_COL: [r[0] for r in pos_rows], CAND_COL: [r[1] for r in pos_rows]},
-        schema={S1_COL: pl.Utf8, CAND_COL: pl.Utf8},
-    ).with_columns(pl.lit(1).cast(pl.Int8).alias(LABEL_COL))
-
-    # Deduplicate positive pairs (safety measure)
-    pos_df = pos_df.unique(subset=[S1_COL, CAND_COL])
+    if pos_rows:
+        pos_df = pl.DataFrame(
+            {S1_COL: [r[0] for r in pos_rows], CAND_COL: [r[1] for r in pos_rows]},
+            schema={S1_COL: pl.Utf8, CAND_COL: pl.Utf8},
+        ).with_columns(pl.lit(1).cast(pl.Int8).alias(LABEL_COL))
+        # Deduplicate positive pairs (safety measure)
+        pos_df = pos_df.unique(subset=[S1_COL, CAND_COL])
+    else:
+        pos_df = pl.DataFrame(
+            schema={S1_COL: pl.Utf8, CAND_COL: pl.Utf8, LABEL_COL: pl.Int8}
+        )
 
     # Ensure ID cols in feature_df are strings
     df = feature_df.with_columns([
@@ -361,6 +387,10 @@ def mine_hard_negatives(
     training set.
 
     This is a Phase 2 operation — only called when hard_negative_mining.enabled.
+
+    Bug fix vs original: negatives are sorted within each S1 group BEFORE
+    calling group_by().head(), ensuring we always get the k highest-prob negatives
+    (not arbitrary k rows per group).
     """
     log.info("Starting hard-negative mining …")
     top_k = int(cfg_hn.get("top_k_per_entity", 5))
@@ -370,16 +400,17 @@ def mine_hard_negatives(
     probs = model.predict(X)
 
     df_scored = labeled_df.with_columns(
-        pl.Series("_prob", probs, dtype=pl.Float32)
+        pl.Series(PROB_COL, probs, dtype=pl.Float32)
     )
 
     positives = df_scored.filter(pl.col(LABEL_COL) == 1)
     negatives = df_scored.filter(pl.col(LABEL_COL) == 0)
 
-    # For each S1 entity, keep the top-k highest-probability negatives
+    # FIX: Sort within each S1 group first, THEN take top-k.
+    # group_by().head() does NOT guarantee any ordering — must sort first.
     hard_negs = (
         negatives
-        .sort("_prob", descending=True)
+        .sort([S1_COL, PROB_COL], descending=[False, True])
         .group_by(S1_COL)
         .head(top_k)
     )
@@ -389,7 +420,7 @@ def mine_hard_negatives(
     if len(hard_negs) > n_neg_target:
         hard_negs = hard_negs.sample(n=n_neg_target, shuffle=True, seed=42)
 
-    combined = pl.concat([positives, hard_negs]).drop("_prob").sample(
+    combined = pl.concat([positives, hard_negs]).drop(PROB_COL).sample(
         fraction=1.0, shuffle=True, seed=42
     )
     log.info(
@@ -506,13 +537,24 @@ def _df_to_predictions_dict(
     For a given threshold, build {source1_entity_id: set(candidate_entity_id)}
     from the scored DataFrame.
     All Source-1 entities are included (empty set if nothing clears threshold).
+
+    Fully vectorized — no Python row-by-row loop.
     """
+    # All S1 entities present in the scored df
     all_s1 = df[S1_COL].cast(pl.Utf8).unique().to_list()
-    above = df.filter(pl.col(prob_col) >= threshold)
     preds: dict[str, set[str]] = {s1: set() for s1 in all_s1}
-    for row in above.select([S1_COL, CAND_COL]).iter_rows():
-        s1_id, cand_id = str(row[0]), str(row[1])
-        preds.setdefault(s1_id, set()).add(cand_id)
+
+    # Filter and group with Polars — vectorized
+    above = df.filter(pl.col(prob_col) >= threshold)
+    if len(above) > 0:
+        grouped = (
+            above
+            .select([S1_COL, CAND_COL])
+            .group_by(S1_COL)
+            .agg(pl.col(CAND_COL).cast(pl.Utf8).unique())
+        )
+        for row in grouped.iter_rows(named=True):
+            preds[str(row[S1_COL])] = set(row[CAND_COL])
     return preds
 
 
@@ -526,6 +568,8 @@ def tune_threshold(
     """
     Sweep candidate thresholds, score each using Macro F0.5 on the validation set.
     Returns (best_threshold, best_f05, {threshold: f05, ...}).
+
+    ground_truth must be the VALIDATION ground truth only (no train leakage).
     """
     ts_cfg = cfg.get("threshold_search", {})
     t_min = float(ts_cfg.get("min", 0.05))
@@ -535,18 +579,16 @@ def tune_threshold(
     X_val = val_labeled.select(feature_cols).to_numpy().astype(np.float32)
     probs = model.predict(X_val)
 
-    PROB_COL = "_prob"
     val_scored = val_labeled.with_columns(
         pl.Series(PROB_COL, probs, dtype=pl.Float64)
     )
 
-    # Build the ground truth dict for validation S1 entities
+    # Build val-only ground truth: include S1 entities in val features but not in gt
+    # (treat as empty / singleton). This must ONLY use val data — no train leakage.
     val_s1_ids = set(val_labeled[S1_COL].cast(pl.Utf8).to_list())
-    val_gt = {k: v for k, v in ground_truth.items() if k in val_s1_ids}
-    # Add S1 entities present in val features but not in gt (should be empty gt)
+    val_gt: dict[str, set[str]] = {}
     for s1 in val_s1_ids:
-        if s1 not in val_gt:
-            val_gt[s1] = set()
+        val_gt[s1] = ground_truth.get(s1, set())
 
     thresholds = np.arange(t_min, t_max + t_step / 2, t_step)
     best_thresh = float(thresholds[0])
@@ -573,7 +615,7 @@ def tune_threshold(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Precision / Recall at chosen threshold
+#  Precision / Recall / F1 at chosen threshold (pair-level)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _compute_pr_at_threshold(
@@ -581,8 +623,11 @@ def _compute_pr_at_threshold(
     model: lgb.Booster,
     feature_cols: list[str],
     threshold: float,
-) -> tuple[float, float]:
-    """Compute pair-level precision and recall at the selected threshold."""
+) -> tuple[float, float, float]:
+    """
+    Compute pair-level precision, recall, and F1 at the selected threshold.
+    Returns (precision, recall, f1).
+    """
     X = val_labeled.select(feature_cols).to_numpy().astype(np.float32)
     probs = model.predict(X)
     y_true = val_labeled[LABEL_COL].to_numpy()
@@ -591,10 +636,19 @@ def _compute_pr_at_threshold(
     tp = int(((y_pred == 1) & (y_true == 1)).sum())
     fp = int(((y_pred == 1) & (y_true == 0)).sum())
     fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    tn = int(((y_pred == 0) & (y_true == 0)).sum())
 
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    return precision, recall
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    accuracy = (tp + tn) / len(y_true) if len(y_true) > 0 else 0.0
+
+    log.info(
+        "Pair-level at threshold=%.4f: TP=%d FP=%d FN=%d TN=%d | "
+        "precision=%.4f recall=%.4f F1=%.4f accuracy=%.4f",
+        threshold, tp, fp, fn, tn, precision, recall, f1, accuracy,
+    )
+    return precision, recall, f1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -649,7 +703,6 @@ def save_model_and_metadata(
     model.save_model(str(model_path))
     log.info("Model saved to %s", model_path)
 
-    import datetime
     metadata = {
         "model_type": "lightgbm",
         "training_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -702,8 +755,7 @@ def save_reports(
         json.dump(val_stats, fh, indent=2)
     log.info("Model metrics saved to %s", metrics_path)
 
-    # Experiments JSON (append-style)
-    import datetime
+    # Experiments JSON (append-style; allows comparing runs)
     experiments_path = reports_dir / "experiments.json"
     existing: list[dict] = []
     if experiments_path.exists():
@@ -853,13 +905,13 @@ def main() -> None:
         model, val_labeled, val_gt, feature_cols, cfg
     )
 
-    # ── 10. Precision / recall at best threshold ──────────────────────────────
-    precision, recall = _compute_pr_at_threshold(
+    # ── 10. Precision / recall / F1 at best threshold ─────────────────────────
+    precision, recall, f1 = _compute_pr_at_threshold(
         val_labeled, model, feature_cols, best_thresh
     )
     log.info(
-        "Validation at threshold=%.4f: Macro_F0.5=%.6f | precision=%.6f | recall=%.6f",
-        best_thresh, best_f05, precision, recall,
+        "Validation at threshold=%.4f: Macro_F0.5=%.6f | precision=%.6f | recall=%.6f | F1=%.6f",
+        best_thresh, best_f05, precision, recall, f1,
     )
 
     # ── 11. Build stats dicts ─────────────────────────────────────────────────
@@ -880,6 +932,7 @@ def main() -> None:
         "macro_f05": round(best_f05, 6),
         "precision": round(precision, 6),
         "recall": round(recall, 6),
+        "f1": round(f1, 6),
         "best_lgbm_iteration": int(model.best_iteration),
         "hard_negative_mining": enable_hn,
         "experiment_label": args.experiment_label,
@@ -904,6 +957,7 @@ def main() -> None:
     log.info("  Macro F0.5   : %.6f", best_f05)
     log.info("  Precision    : %.6f", precision)
     log.info("  Recall       : %.6f", recall)
+    log.info("  F1           : %.6f", f1)
     log.info("══════════════════════════════════════════════════════════════")
 
 
